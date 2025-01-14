@@ -1,10 +1,10 @@
 """Contains all logic to handle changes to posts in the help forum."""
-import textwrap
 from datetime import timedelta
 
 import arrow
 import discord
-from pydis_core.utils import members, scheduling
+from pydis_core.utils import scheduling
+from pydis_core.utils.channel import get_or_fetch_channel
 
 import bot
 from bot import constants
@@ -19,9 +19,9 @@ POST_TITLE = "Python help channel"
 
 NEW_POST_MSG = """
 **Remember to:**
-• **Ask** your Python question, not if you can ask or if there's an expert who can help.
-• **Show** a code sample as text (rather than a screenshot) and the error message, if you've got one.
-• **Explain** what you expect to happen and what actually happens.
+- **Ask** your Python question, not if you can ask or if there's an expert who can help.
+- **Show** a code sample as text (rather than a screenshot) and the error message, if you've got one.
+- **Explain** what you expect to happen and what actually happens.
 
 :warning: Do not pip install anything that isn't related to your question, especially if asked to over DMs.
 """
@@ -44,6 +44,9 @@ def is_help_forum_post(channel: discord.abc.GuildChannel) -> bool:
 
 async def _close_help_post(closed_post: discord.Thread, closing_reason: _stats.ClosingReason) -> None:
     """Close the help post and record stats."""
+    # Get Thread with updated metadata (such as the title)
+    closed_post = await get_or_fetch_channel(bot.instance, closed_post.id)
+
     embed = discord.Embed(description=CLOSED_POST_MSG)
     embed.set_author(name=f"{POST_TITLE} closed", icon_url=CLOSED_POST_ICON_URL)
     message = ""
@@ -58,7 +61,11 @@ async def _close_help_post(closed_post: discord.Thread, closing_reason: _stats.C
         if participant_ids == {closed_post.owner_id}:
             message = closed_post.owner.mention
 
-    await closed_post.send(message, embed=embed)
+    try:
+        await closed_post.send(message, embed=embed)
+    except discord.errors.HTTPException:
+        log.info("Could not send closing message in %s (%d), closing anyway", closed_post, closed_post.id)
+
     await closed_post.edit(
         name=f"🔒 {closed_post.name}"[:100],
         archived=True,
@@ -68,19 +75,6 @@ async def _close_help_post(closed_post: discord.Thread, closing_reason: _stats.C
 
     _stats.report_post_count()
     await _stats.report_complete_session(closed_post, closing_reason)
-
-    poster = closed_post.owner
-    cooldown_role = closed_post.guild.get_role(constants.Roles.help_cooldown)
-
-    if poster is None:
-        # We can't include the owner ID/name here since the thread only contains None
-        log.info(
-            f"Failed to remove cooldown role for owner of post ({closed_post.id}). "
-            f"The user is likely no longer on the server."
-        )
-        return
-
-    await members.handle_role_change(poster, poster.remove_roles, cooldown_role)
 
 
 async def send_opened_post_message(post: discord.Thread) -> None:
@@ -94,44 +88,6 @@ async def send_opened_post_message(post: discord.Thread) -> None:
     await post.send(embed=embed, content=post.owner.mention)
 
 
-async def send_opened_post_dm(post: discord.Thread) -> None:
-    """Send the opener a DM message with a jump link to their new post."""
-    embed = discord.Embed(
-        title="Help post opened",
-        description=f"You opened {post.mention}.",
-        colour=constants.Colours.bright_green,
-        timestamp=post.created_at,
-    )
-    embed.set_thumbnail(url=constants.Icons.green_questionmark)
-    message = post.starter_message
-    if not message:
-        try:
-            message = await post.fetch_message(post.id)
-        except discord.HTTPException:
-            log.warning(f"Could not fetch message for post {post.id}")
-            return
-
-    formatted_message = textwrap.shorten(message.content, width=100, placeholder="...").strip()
-    if not formatted_message:
-        # This most likely means the initial message is only an image or similar
-        formatted_message = "No text content."
-
-    embed.add_field(name="Your message", value=formatted_message, inline=False)
-    embed.add_field(
-        name="Conversation",
-        value=f"[Jump to message!]({message.jump_url})",
-        inline=False,
-    )
-
-    try:
-        await post.owner.send(embed=embed)
-        log.trace(f"Sent DM to {post.owner} ({post.owner_id}) after posting in help forum.")
-    except discord.errors.Forbidden:
-        log.trace(
-            f"Ignoring to send DM to {post.owner} ({post.owner_id}) after posting in help forum: DMs disabled.",
-        )
-
-
 async def help_post_opened(opened_post: discord.Thread, *, reopen: bool = False) -> None:
     """Apply new post logic to a new help forum post."""
     _stats.report_post_count()
@@ -141,8 +97,6 @@ async def help_post_opened(opened_post: discord.Thread, *, reopen: bool = False)
         log.debug(f"{opened_post.owner_id} isn't a member. Closing post.")
         await _close_help_post(opened_post, _stats.ClosingReason.CLEANUP)
         return
-
-    await send_opened_post_dm(opened_post)
 
     try:
         await opened_post.starter_message.pin()
@@ -158,9 +112,6 @@ async def help_post_opened(opened_post: discord.Thread, *, reopen: bool = False)
                 raise e
 
     await send_opened_post_message(opened_post)
-
-    cooldown_role = opened_post.guild.get_role(constants.Roles.help_cooldown)
-    await members.handle_role_change(opened_post.owner, opened_post.owner.add_roles, cooldown_role)
 
 
 async def help_post_closed(closed_post: discord.Thread) -> None:
@@ -188,10 +139,7 @@ async def help_post_deleted(deleted_post_event: discord.RawThreadDeleteEvent) ->
     cached_post = deleted_post_event.thread
     if cached_post and not cached_post.archived:
         # If the post is in the bot's cache, and it was not archived before deleting,
-        # report a complete session and remove the cooldown.
-        poster = cached_post.owner
-        cooldown_role = cached_post.guild.get_role(constants.Roles.help_cooldown)
-        await members.handle_role_change(poster, poster.remove_roles, cooldown_role)
+        # report a complete session.
         await _stats.report_complete_session(cached_post, _stats.ClosingReason.DELETED)
 
 
@@ -224,15 +172,10 @@ async def get_closing_time(post: discord.Thread) -> tuple[arrow.Arrow, _stats.Cl
     return time, _stats.ClosingReason.INACTIVE
 
 
-async def maybe_archive_idle_post(post: discord.Thread, scheduler: scheduling.Scheduler, has_task: bool = True) -> None:
-    """
-    Archive the `post` if idle, or schedule the archive for later if still active.
-
-    If `has_task` is True and rescheduling is required, the extant task to make the post
-    dormant will first be cancelled.
-    """
+async def maybe_archive_idle_post(post: discord.Thread, scheduler: scheduling.Scheduler) -> None:
+    """Archive the `post` if idle, or schedule the archive for later if still active."""
     try:
-        await post.guild.fetch_channel(post.id)
+        await get_or_fetch_channel(bot.instance, post.id)
     except discord.HTTPException:
         log.trace(f"Not closing missing post #{post} ({post.id}).")
         return
@@ -254,9 +197,10 @@ async def maybe_archive_idle_post(post: discord.Thread, scheduler: scheduling.Sc
         await _close_help_post(post, closing_reason)
         return
 
-    if has_task:
+    if post.id in scheduler:
+        # Cancel any existing close task
         scheduler.cancel(post.id)
     delay = (closing_time - arrow.utcnow()).seconds
     log.info(f"#{post} ({post.id}) is still active; scheduling it to be archived after {delay} seconds.")
 
-    scheduler.schedule_later(delay, post.id, maybe_archive_idle_post(post, scheduler, has_task=True))
+    scheduler.schedule_later(delay, post.id, maybe_archive_idle_post(post, scheduler))

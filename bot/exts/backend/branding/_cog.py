@@ -7,7 +7,6 @@ from datetime import timedelta
 from enum import Enum
 from operator import attrgetter
 
-import async_timeout
 import discord
 from arrow import Arrow
 from async_rediscache import RedisCache
@@ -158,12 +157,12 @@ class Branding(commands.Cog):
 
         timeout = 10  # Seconds.
         try:
-            with async_timeout.timeout(timeout):  # Raise after `timeout` seconds.
+            async with asyncio.timeout(timeout):  # Raise after `timeout` seconds.
                 await pydis.edit(**{asset_type.value: file})
         except discord.HTTPException:
             log.exception("Asset upload to Discord failed.")
             return False
-        except asyncio.TimeoutError:
+        except TimeoutError:
             log.error(f"Asset upload to Discord timed out after {timeout} seconds.")
             return False
         else:
@@ -343,13 +342,13 @@ class Branding(commands.Cog):
         """
         log.debug("Synchronise: fetching current event.")
 
-        current_event, available_events = await self.repository.get_current_event()
+        try:
+            current_event, available_events = await self.repository.get_current_event()
+        except Exception:
+            log.exception("Synchronisation aborted: failed to fetch events.")
+            return False, False
 
         await self.populate_cache_events(available_events)
-
-        if current_event is None:
-            log.error("Failed to fetch event. Cannot synchronise!")
-            return False, False
 
         return await self.enter_event(current_event)
 
@@ -433,10 +432,6 @@ class Branding(commands.Cog):
         new_event, available_events = await self.repository.get_current_event()
 
         await self.populate_cache_events(available_events)
-
-        if new_event is None:
-            log.warning("Daemon main: failed to get current event from branding repository, will do nothing.")
-            return
 
         if new_event.path != await self.cache_information.get("event_path"):
             log.debug("Daemon main: new event detected!")
@@ -597,10 +592,24 @@ class Branding(commands.Cog):
         log.info("Performing command-requested event cache refresh.")
 
         async with ctx.typing():
-            available_events = await self.repository.get_events()
-            await self.populate_cache_events(available_events)
+            try:
+                available_events = await self.repository.get_events()
+            except Exception:
+                log.exception("Refresh aborted: failed to fetch events.")
+                resp = make_embed(
+                    "Refresh aborted",
+                    "Failed to fetch events. See log for details.",
+                    success=False,
+                )
+            else:
+                await self.populate_cache_events(available_events)
+                resp = make_embed(
+                    "Refresh successful",
+                    "The event calendar has been refreshed.",
+                    success=True,
+                )
 
-        await ctx.invoke(self.branding_calendar_group)
+        await ctx.send(embed=resp)
 
     # endregion
     # region: Command interface (branding daemon)
