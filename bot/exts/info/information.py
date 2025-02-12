@@ -8,12 +8,15 @@ from typing import Any, TYPE_CHECKING
 
 import rapidfuzz
 from discord import AllowedMentions, Colour, Embed, Guild, Message, Role
-from discord.ext.commands import BucketType, Cog, Context, Paginator, command, group, has_any_role
+from discord.ext.commands import BucketType, Cog, Context, command, group, has_any_role
 from discord.utils import escape_markdown
 from pydis_core.site_api import ResponseCodeError
+from pydis_core.utils.members import get_or_fetch_member
+from pydis_core.utils.paste_service import PasteFile, PasteTooLongError, PasteUploadError, send_to_paste_service
 
 from bot import constants
 from bot.bot import Bot
+from bot.constants import BaseURLs, Emojis
 from bot.converters import MemberOrUser
 from bot.decorators import in_whitelist
 from bot.errors import NonExistentRoleError
@@ -22,7 +25,7 @@ from bot.pagination import LinePaginator
 from bot.utils import time
 from bot.utils.channel import is_mod_channel, is_staff_channel
 from bot.utils.checks import cooldown_with_role_bypass, has_no_roles_check, in_whitelist_check
-from bot.utils.members import get_or_fetch_member
+from bot.utils.messages import send_denial
 
 log = get_logger(__name__)
 
@@ -320,6 +323,7 @@ class Information(Cog):
         if is_mod_channel(ctx.channel):
             fields.append(await self.expanded_user_infraction_counts(user))
             fields.append(await self.user_nomination_counts(user))
+            fields.append(await self.user_alt_count(user))
         else:
             fields.append(await self.basic_user_infraction_counts(user))
 
@@ -336,6 +340,20 @@ class Information(Cog):
         embed.colour = user.colour if user.colour != Colour.default() else Colour.og_blurple()
 
         return embed
+
+    async def user_alt_count(self, user: MemberOrUser) -> tuple[str, int | str]:
+        """Get the number of alts for the given member."""
+        try:
+            resp = await self.bot.api_client.get(f"bot/users/{user.id}")
+            return ("Associated accounts", len(resp["alts"]) or "No associated accounts")
+        except ResponseCodeError as e:
+            # If user is not found, return a soft-error regarding this.
+            if e.response.status == 404:
+                return ("Associated accounts", "User not found in site database.")
+
+            # If we have any other issue, re-raise the exception
+            raise e
+
 
     async def basic_user_infraction_counts(self, user: MemberOrUser) -> tuple[str, str]:
         """Gets the total and active infraction counts for the given `member`."""
@@ -420,7 +438,7 @@ class Information(Cog):
 
         return "Nominations", "\n".join(output)
 
-    async def user_messages(self, user: MemberOrUser) -> tuple[bool | str, tuple[str, str]]:
+    async def user_messages(self, user: MemberOrUser) -> tuple[str, str]:
         """
         Gets the amount of messages for `member`.
 
@@ -435,15 +453,21 @@ class Information(Cog):
             if e.status == 404:
                 activity_output = "No activity"
         else:
-            activity_output.append(f"{user_activity['total_messages']:,}" or "No messages")
-            activity_output.append(f"{user_activity['activity_blocks']:,}" or "No activity")
+            total_message_text = (
+                f"{user_activity['total_messages']:,}" if user_activity["total_messages"] else "No messages"
+            )
+            activity_blocks_text = (
+                f"{user_activity['activity_blocks']:,}" if user_activity["activity_blocks"] else "No activity"
+            )
+            activity_output.append(total_message_text)
+            activity_output.append(activity_blocks_text)
 
             activity_output = "\n".join(
                 f"{name}: {metric}"
                 for name, metric in zip(["Messages", "Activity blocks"], activity_output, strict=True)
             )
 
-        return ("Activity", activity_output)
+        return "Activity", activity_output
 
     def format_fields(self, mapping: Mapping[str, Any], field_width: int | None = None) -> str:
         """Format a mapping to be readable to a human."""
@@ -494,14 +518,13 @@ class Information(Cog):
         # doing this extra request is also much easier than trying to convert everything back into a dictionary again
         raw_data = await ctx.bot.http.get_message(message.channel.id, message.id)
 
-        paginator = Paginator()
+        lines = []
 
         def add_content(title: str, content: str) -> None:
-            paginator.add_line(f"== {title} ==\n")
+            lines.append(f"== {title} ==\n")
             # Replace backticks as it breaks out of code blocks.
-            # An invisible character seemed to be the most reasonable solution. We hope it's not close to 2000.
-            paginator.add_line(content.replace("`", "`\u200b"))
-            paginator.close_page()
+            # An invisible character seemed to be the most reasonable solution.
+            lines.append(content.replace("`", "`\u200b"))
 
         if message.content:
             add_content("Raw message", message.content)
@@ -518,19 +541,54 @@ class Information(Cog):
                 title = f"Raw {field_name} ({current}/{total})"
                 add_content(title, transformer(item))
 
-        for page in paginator.pages:
-            await ctx.send(page, allowed_mentions=AllowedMentions.none())
+        output = "\n".join(lines)
+        if len(output) < 2000-8:  # To cover the backticks and newlines added below.
+            await ctx.send(f"```\n{output}\n```", allowed_mentions=AllowedMentions.none())
+            return
+
+        file = PasteFile(content=output, lexer="text")
+        try:
+            resp = await send_to_paste_service(
+                files=[file],
+                http_session=self.bot.http_session,
+                paste_url=BaseURLs.paste_url,
+            )
+            message = f"Message was too long for Discord, posted the output to [our pastebin]({resp.link})."
+        except PasteTooLongError:
+            message = f"{Emojis.cross_mark} Too long to upload to paste service."
+        except PasteUploadError:
+            message = f"{Emojis.cross_mark} Failed to upload to paste service."
+
+        await ctx.send(message)
 
     @cooldown_with_role_bypass(2, 60 * 3, BucketType.member, bypass_roles=constants.STAFF_PARTNERS_COMMUNITY_ROLES)
     @group(invoke_without_command=True)
     @in_whitelist(channels=(constants.Channels.bot_commands,), roles=constants.STAFF_PARTNERS_COMMUNITY_ROLES)
-    async def raw(self, ctx: Context, message: Message) -> None:
+    async def raw(self, ctx: Context, message: Message | None = None) -> None:
         """Shows information about the raw API response."""
+        if message is None:
+            if (reference := ctx.message.reference) and isinstance(reference.resolved, Message):
+                message = reference.resolved
+            else:
+                await send_denial(
+                    ctx, "Missing message argument. Please provide a message ID/link or reply to a message."
+                )
+                return
+
         await self.send_raw_content(ctx, message)
 
     @raw.command()
-    async def json(self, ctx: Context, message: Message) -> None:
+    async def json(self, ctx: Context, message: Message | None = None) -> None:
         """Shows information about the raw API response in a copy-pasteable Python format."""
+        if message is None:
+            if (reference := ctx.message.reference) and isinstance(reference.resolved, Message):
+                message = reference.resolved
+            else:
+                await send_denial(
+                    ctx, "Missing message argument. Please provide a message ID/link or reply to a message."
+                )
+                return
+
         await self.send_raw_content(ctx, message, json=True)
 
     async def _set_rules_command_help(self) -> None:

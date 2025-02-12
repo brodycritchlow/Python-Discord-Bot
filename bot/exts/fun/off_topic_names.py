@@ -5,7 +5,7 @@ import json
 import random
 from functools import partial
 
-from discord import ButtonStyle, Colour, Embed, Interaction
+from discord import ButtonStyle, Colour, Embed, HTTPException, Interaction
 from discord.ext import tasks
 from discord.ext.commands import Cog, Context, group, has_any_role
 from discord.ui import Button, View
@@ -61,9 +61,18 @@ class OffTopicNames(Cog):
 
         channel_0, channel_1, channel_2 = (self.bot.get_channel(channel_id) for channel_id in CHANNELS)
 
-        await channel_0.edit(name=OTN_FORMATTER.format(number=0, name=channel_0_name))
-        await channel_1.edit(name=OTN_FORMATTER.format(number=1, name=channel_1_name))
-        await channel_2.edit(name=OTN_FORMATTER.format(number=2, name=channel_2_name))
+        try:
+            await channel_0.edit(name=OTN_FORMATTER.format(number=0, name=channel_0_name))
+            await channel_1.edit(name=OTN_FORMATTER.format(number=1, name=channel_1_name))
+            await channel_2.edit(name=OTN_FORMATTER.format(number=2, name=channel_2_name))
+        except HTTPException:
+            await self.bot.get_channel(Channels.mod_meta).send(
+                ":exclamation: Got an error trying to update OT names to"
+                f"{channel_0_name}, {channel_1_name} and {channel_2_name}."
+                "\nI will retry with new names, but please delete the ones that sound bad."
+            )
+            await self.update_names()
+            return
 
         log.debug(
             "Updated off-topic channel names to"
@@ -81,7 +90,7 @@ class OffTopicNames(Cog):
     async def list_ot_names(self, ctx: Context, active: bool = True) -> None:
         """Send an embed containing active/deactivated off-topic channel names."""
         result = await self.bot.api_client.get("bot/off-topic-channel-names", params={"active": json.dumps(active)})
-        lines = sorted(f"• {name}" for name in result)
+        lines = sorted(f"- {name}" for name in result)
         embed = Embed(
             title=f"{'Active' if active else 'Deactivated'} off-topic names (`{len(result)}` total)",
             colour=Colour.blue()
@@ -207,7 +216,7 @@ class OffTopicNames(Cog):
 
         try:
             await asyncio.wait_for(rename_channel(), 3)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # Channel rename endpoint rate limited. The task was cancelled by asyncio.
             btn_yes = Button(label="Yes", style=ButtonStyle.success)
             btn_no = Button(label="No", style=ButtonStyle.danger)
@@ -286,7 +295,7 @@ class OffTopicNames(Cog):
         close_matches = difflib.get_close_matches(query, result.keys(), n=10, cutoff=0.70)
 
         # Send Results
-        lines = sorted(f"• {result[name]}" for name in in_matches.union(close_matches))
+        lines = sorted(f"- {result[name]}" for name in in_matches.union(close_matches))
         embed = Embed(
             title="Query results",
             colour=Colour.blue()

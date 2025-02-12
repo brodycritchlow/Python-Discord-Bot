@@ -1,3 +1,4 @@
+import gettext
 import re
 import textwrap
 import typing as t
@@ -6,6 +7,7 @@ import discord
 from discord.ext import commands
 from discord.ext.commands import Context
 from discord.utils import escape_markdown
+from pydis_core.utils.members import get_or_fetch_member
 
 from bot import constants
 from bot.bot import Bot
@@ -15,12 +17,11 @@ from bot.decorators import ensure_future_timestamp
 from bot.errors import InvalidInfractionError
 from bot.exts.moderation.infraction import _utils
 from bot.exts.moderation.infraction.infractions import Infractions
-from bot.exts.moderation.modlog import ModLog
 from bot.log import get_logger
 from bot.pagination import LinePaginator
 from bot.utils import messages, time
 from bot.utils.channel import is_in_category, is_mod_channel
-from bot.utils.members import get_or_fetch_member
+from bot.utils.modlog import send_log_message
 from bot.utils.time import unpack_duration
 
 log = get_logger(__name__)
@@ -56,11 +57,6 @@ class ModManagement(commands.Cog):
             self.search_by_actor
         ):
             command.help += f"\n{SYMBOLS_GUIDE}"
-
-    @property
-    def mod_log(self) -> ModLog:
-        """Get currently loaded ModLog cog instance."""
-        return self.bot.get_cog("ModLog")
 
     @property
     def infractions_cog(self) -> Infractions:
@@ -202,8 +198,8 @@ class ModManagement(commands.Cog):
             # Update `last_applied` if expiry changes.
             request_data["last_applied"] = origin.isoformat()
             request_data["expires_at"] = expiry.isoformat()
-            expiry = time.format_with_duration(expiry, origin)
-            confirm_messages.append(f"set to expire on {expiry}")
+            formatted_expiry = time.format_with_duration(expiry, origin)
+            confirm_messages.append(f"set to expire on {formatted_expiry}")
         else:
             confirm_messages.append("expiry unchanged")
 
@@ -223,6 +219,10 @@ class ModManagement(commands.Cog):
             json=request_data,
         )
 
+        # Get information about the infraction's user
+        user_id = new_infraction["user"]
+        user = await get_or_fetch_member(ctx.guild, user_id)
+
         # Re-schedule infraction if the expiration has been updated
         if "expires_at" in request_data:
             # A scheduled task should only exist if the old infraction wasn't permanent
@@ -232,6 +232,12 @@ class ModManagement(commands.Cog):
             # If the infraction was not marked as permanent, schedule a new expiration task
             if request_data["expires_at"]:
                 self.infractions_cog.schedule_expiration(new_infraction)
+                # Timeouts are handled by Discord itself, so we need to edit the expiry in Discord as well
+                if user and infraction["type"] == "timeout":
+                    capped, duration = _utils.cap_timeout_duration(expiry)
+                    if capped:
+                        await _utils.notify_timeout_cap(self.bot, ctx, user)
+                    await user.edit(reason=reason, timed_out_until=expiry)
 
             log_text += f"""
                 Previous expiry: {time.until_expiration(infraction['expires_at'])}
@@ -240,10 +246,6 @@ class ModManagement(commands.Cog):
 
         changes = " & ".join(confirm_messages)
         await ctx.send(f":ok_hand: Updated infraction #{infraction_id}: {changes}")
-
-        # Get information about the infraction's user
-        user_id = new_infraction["user"]
-        user = await get_or_fetch_member(ctx.guild, user_id)
 
         if user:
             user_text = messages.format_user(user)
@@ -260,7 +262,8 @@ class ModManagement(commands.Cog):
         else:
             jump_url = f"[Click here.]({ctx.message.jump_url})"
 
-        await self.mod_log.send_log_message(
+        await send_log_message(
+            self.bot,
             icon_url=constants.Icons.pencil,
             colour=discord.Colour.og_blurple(),
             title="Infraction edited",
@@ -299,8 +302,8 @@ class ModManagement(commands.Cog):
             user_str = escape_markdown(str(user))
         else:
             if infraction_list:
-                user = infraction_list[0]["user"]
-                user_str = escape_markdown(user["name"]) + f"#{user['discriminator']:04}"
+                user_data = infraction_list[0]["user"]
+                user_str = escape_markdown(user_data["name"]) + f"#{user_data['discriminator']:04}"
             else:
                 user_str = str(user.id)
 
@@ -311,6 +314,10 @@ class ModManagement(commands.Cog):
         )
         # Manually form mention from ID as discord.Object doesn't have a `.mention` attr
         prefix = f"<@{user.id}> - {user.id}"
+        # If the user has alts show in the prefix
+        if infraction_list and (alts := infraction_list[0]["user"]["alts"]):
+            prefix += f" ({len(alts)} associated {gettext.ngettext('account', 'accounts', len(alts))})"
+
         await self.send_infraction_list(ctx, embed, infraction_list, prefix, ("user",))
 
     @infraction_search_group.command(name="reason", aliases=("match", "regex", "re"))
