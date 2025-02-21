@@ -10,7 +10,7 @@ import discord
 from aiohttp import ClientConnectorError
 from dateutil.relativedelta import relativedelta
 from discord.ext.commands import BadArgument, Context, Converter, IDConverter, MemberConverter, UserConverter
-from discord.utils import escape_markdown, snowflake_time
+from discord.utils import snowflake_time
 from pydis_core.site_api import ResponseCodeError
 from pydis_core.utils import unqualify
 from pydis_core.utils.regex import DISCORD_INVITE
@@ -19,7 +19,6 @@ from bot import exts, instance as bot_instance
 from bot.constants import URLs
 from bot.errors import InvalidInfractionError
 from bot.exts.info.doc import _inventory_parser
-from bot.exts.info.tags import TagIdentifier
 from bot.log import get_logger
 from bot.utils import time
 
@@ -220,39 +219,6 @@ class Snowflake(IDConverter):
         return snowflake
 
 
-class SourceConverter(Converter):
-    """Convert an argument into a help command, tag, command, or cog."""
-
-    @staticmethod
-    async def convert(ctx: Context, argument: str) -> SourceType:
-        """Convert argument into source object."""
-        if argument.lower() == "help":
-            return ctx.bot.help_command
-
-        cog = ctx.bot.get_cog(argument)
-        if cog:
-            return cog
-
-        cmd = ctx.bot.get_command(argument)
-        if cmd:
-            return cmd
-
-        tags_cog = ctx.bot.get_cog("Tags")
-        show_tag = True
-
-        if not tags_cog:
-            show_tag = False
-        else:
-            identifier = TagIdentifier.from_string(argument.lower())
-            if identifier in tags_cog.tags:
-                return identifier
-        escaped_arg = escape_markdown(argument)
-
-        raise BadArgument(
-            f"Unable to convert '{escaped_arg}' to valid command{', tag,' if show_tag else ''} or Cog."
-        )
-
-
 class DurationDelta(Converter):
     """Convert duration strings into dateutil.relativedelta.relativedelta objects."""
 
@@ -423,23 +389,19 @@ class HushDurationConverter(Converter):
 
 
 def _is_an_unambiguous_user_argument(argument: str) -> bool:
-    """Check if the provided argument is a user mention, user id, or username (name#discrim)."""
-    has_id_or_mention = bool(IDConverter()._get_id_match(argument) or RE_USER_MENTION.match(argument))
+    """Check if the provided argument is a user mention or user id."""
+    user_id = IDConverter._get_id_match(argument)
+    user_mention = RE_USER_MENTION.match(argument)
 
-    # Check to see if the author passed a username (a discriminator exists)
-    argument = argument.removeprefix("@")
-    has_username = len(argument) > 5 and argument[-5] == "#"
-
-    return has_id_or_mention or has_username
+    return bool(user_id or user_mention)
 
 
-AMBIGUOUS_ARGUMENT_MSG = ("`{argument}` is not a User mention, a User ID or a Username in the format"
-                          " `name#discriminator`.")
+AMBIGUOUS_ARGUMENT_MSG = "`{argument}` is not a User mention or a User ID."
 
 
 class UnambiguousUser(UserConverter):
     """
-    Converts to a `discord.User`, but only if a mention, userID or a username (name#discrim) is provided.
+    Converts to a `discord.User`, but only if a mention or userID is provided.
 
     Unlike the default `UserConverter`, it doesn't allow conversion from a name.
     This is useful in cases where that lookup strategy would lead to too much ambiguity.
@@ -454,7 +416,7 @@ class UnambiguousUser(UserConverter):
 
 class UnambiguousMember(MemberConverter):
     """
-    Converts to a `discord.Member`, but only if a mention, userID or a username (name#discrim) is provided.
+    Converts to a `discord.Member`, but only if a mention or userID is provided.
 
     Unlike the default `MemberConverter`, it doesn't allow conversion from a name or nickname.
     This is useful in cases where that lookup strategy would lead to too much ambiguity.
@@ -504,23 +466,23 @@ class Infraction(Converter):
 
 
 if t.TYPE_CHECKING:
-    ValidDiscordServerInvite = dict  # noqa: F811
+    ValidDiscordServerInvite = dict
     ValidFilterListType = str
-    Extension = str  # noqa: F811
-    PackageName = str  # noqa: F811
-    ValidURL = str  # noqa: F811
-    Inventory = tuple[str, _inventory_parser.InventoryDict]  # noqa: F811
-    Snowflake = int  # noqa: F811
-    SourceConverter = SourceType  # noqa: F811
+    Extension = str
+    PackageName = str
+    ValidURL = str
+    Inventory = tuple[str, _inventory_parser.InventoryDict]
+    Snowflake = int
+    SourceConverter = SourceType
     DurationDelta = relativedelta
-    Duration = datetime  # noqa: F811
-    Age = datetime  # noqa: F811
-    OffTopicName = str  # noqa: F811
-    ISODateTime = datetime  # noqa: F811
-    HushDurationConverter = int  # noqa: F811
-    UnambiguousUser = discord.User  # noqa: F811
-    UnambiguousMember = discord.Member  # noqa: F811
-    Infraction = dict | None  # noqa: F811
+    Duration = datetime
+    Age = datetime
+    OffTopicName = str
+    ISODateTime = datetime
+    HushDurationConverter = int
+    UnambiguousUser = discord.User
+    UnambiguousMember = discord.Member
+    Infraction = dict | None
 
 Expiry = Duration | ISODateTime
 DurationOrExpiry = DurationDelta | ISODateTime
