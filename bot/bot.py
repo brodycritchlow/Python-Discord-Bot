@@ -1,8 +1,12 @@
 import asyncio
+import contextlib
+from sys import exception
 
 import aiohttp
+from discord.errors import Forbidden
 from pydis_core import BotBase
-from sentry_sdk import push_scope
+from pydis_core.utils.error_handling import handle_forbidden_from_block
+from sentry_sdk import new_scope, start_transaction
 
 from bot import constants, exts
 from bot.log import get_logger
@@ -24,6 +28,11 @@ class Bot(BotBase):
     def __init__(self, *args, **kwargs):
 
         super().__init__(*args, **kwargs)
+
+    async def load_extension(self, name: str, *args, **kwargs) -> None:
+        """Extend D.py's load_extension function to also record sentry performance stats."""
+        with start_transaction(op="cog-load", name=name):
+            await super().load_extension(name, *args, **kwargs)
 
     async def ping_services(self) -> None:
         """A helper to make sure all the services the bot relies on are available on startup."""
@@ -48,9 +57,21 @@ class Bot(BotBase):
 
     async def on_error(self, event: str, *args, **kwargs) -> None:
         """Log errors raised in event listeners rather than printing them to stderr."""
+        e_val = exception()
+
+        if isinstance(e_val, Forbidden):
+            message = args[0] if event == "on_message" else args[1] if event == "on_message_edit" else None
+
+            with contextlib.suppress(Forbidden):
+                # Attempt to handle the error. This reraises the error if's not due to a block,
+                # in which case the error is suppressed and handled normally. Otherwise, it was
+                # handled so return.
+                await handle_forbidden_from_block(e_val, message)
+                return
+
         self.stats.incr(f"errors.event.{event}")
 
-        with push_scope() as scope:
+        with new_scope() as scope:
             scope.set_tag("event", event)
             scope.set_extra("args", args)
             scope.set_extra("kwargs", kwargs)
